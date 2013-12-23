@@ -1,0 +1,10 @@
+syntax:glob
+build
+dist
+*.pyc
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+*~
+tmp_testsuitedir/
