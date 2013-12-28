@@ -6,6 +6,10 @@
 import os
 import sys
 import socket
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import SocketServer
 import threading
 import select
@@ -13,6 +17,7 @@ import logging
 import glob
 import errno
 import binascii
+import locale
 
 try:
     #raise ImportError ## Debug, pretend we are 2.3 and earlier
@@ -81,6 +86,10 @@ except ImportError:
     srp = fake_module('srp')
 
 
+FILENAME_ENCODING = 'UTF-8'
+FILENAME_ENCODING = 'cp1252'  # latin1 encoding used by sksync 1
+language_name, SYSTEM_ENCODING = locale.getdefaultlocale()
+#print language_name, SYSTEM_ENCODING
 
 # SK Sync specific constants
 SKSYNC_DEFAULT_PORT = 23456
@@ -97,6 +106,9 @@ SKSYNC_PROTOCOL_TYPE_TO_SERVER_NO_TIME = '4\n'
 
 SKSYNC_PROTOCOL_RECURSIVE = '0\n'
 SKSYNC_PROTOCOL_NON_RECURSIVE = '1\n'
+
+if ssl:
+    SSL_VERSION = ssl.PROTOCOL_TLSv1
 
 
 # PYSKSYNC specific constants
@@ -274,7 +286,7 @@ def path_walker(path_to_search, filename_filter=None, abspath=False):
 
 ###############################################################
 
-def get_file_listings(path_of_files, recursive=False, include_size=False, return_list=True):
+def get_file_listings(path_of_files, recursive=False, include_size=False, return_list=True, force_unicode=False):
     """return_list=True, if False returns dict
     """
     
@@ -299,6 +311,11 @@ def get_file_listings(path_of_files, recursive=False, include_size=False, return
             mtime = x.st_mtime
             # TODO non-ascii path names
             mtime = int(mtime) * 1000  # TODO norm
+            if force_unicode:
+                if isinstance(filename, str):
+                    # This is probably Windows
+                    # Assume str, in locale encoding
+                    filename = filename.decode(SYSTEM_ENCODING)
             if include_size:
                 file_details = (filename, mtime, x.st_size)
             else:
@@ -307,6 +324,11 @@ def get_file_listings(path_of_files, recursive=False, include_size=False, return
                 listings_result.append(file_details)
             else:
                 listings_result[filename] = file_details[1:]
+        else:
+            # Probably Windows, with a (byte/str) filename containing
+            # characters that are NOT in the current locale we can't
+            # access it unless we have a Unicode filename
+            logger.error('Unable to access and process %r, ignoring"', filename)
     os.chdir(current_dir)
     return listings_result
 
@@ -330,8 +352,35 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
 
         sync_timer = SimpleTimer()
         sync_timer.start()
-        
+
         # self.request is the TCP socket connected to the client
+        if config.get('use_ssl'):
+            try:
+                logger.info('Attempting SSL session')
+                ssl_server_certfile = config.get('ssl_server_certfile')
+                ssl_server_keyfile = config.get('ssl_server_keyfile')
+                logger.info('using SSL certificate file  %r' % ssl_server_certfile)
+                logger.info('using SSL key file  %r' % ssl_server_keyfile)
+
+                if config.get('ssl_client_certfile'):
+                    self.request = ssl.wrap_socket(self.request,
+                                    server_side=True,
+                                    certfile=ssl_server_certfile,
+                                    keyfile=ssl_server_keyfile,
+                                    ca_certs=config['ssl_client_certfile'],  # verify client
+                                    cert_reqs=ssl.CERT_REQUIRED,
+                                    ssl_version=SSL_VERSION)
+                else:
+                    self.request = ssl.wrap_socket(self.request,
+                                    server_side=True,
+                                    certfile=ssl_server_certfile,
+                                    keyfile=ssl_server_keyfile,
+                                    ssl_version=SSL_VERSION)
+                logger.info('SSL connected using %r', self.request.cipher())
+            except ssl.SSLError, info:
+                logger.error('Error starting SSL, check certificate and key are valid. %r' % info)
+                # could be a bad client....
+                return
         reader = SKBufferedSocket(self.request)
         response = reader.next()
         logger.debug('Received: %r' % response)
@@ -440,6 +489,8 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
             # TODO start counting and other stats
             # read all file details
             filename, mtime = parse_file_details(response)
+            logger.debug('Received meta data for: %r' % ((filename, mtime),))
+            filename = filename.decode(FILENAME_ENCODING)
             if os.path.sep == '\\':
                 # Windows
                 filename = filename.replace('/', '\\')  # Unix path conversion to Windows
@@ -453,7 +504,7 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
         # TODO start counting and other stats
         # TODO output count and other stats
         logger.info('Number of files on client %r ' % (len(client_files),))
-        server_files = get_file_listings(server_path, recursive=recursive, include_size=True, return_list=False)
+        server_files = get_file_listings(server_path, recursive=recursive, include_size=True, return_list=False, force_unicode=True)
         logger.info('Number of files on server %r ' % (len(server_files),))
         
         server_files_set = set(server_files)
@@ -492,30 +543,48 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
         current_dir = os.getcwd()  # TODO non-ascii; os.getcwdu()
         os.chdir(server_path)
         sent_count = 0
+        skip_count = 0
         try:
             for filename in missing_from_client:
-                logger.debug('File to send: %r', filename)
-                mtime, data_len = server_files[filename]
-                if os.path.sep == '\\':
-                    # Windows path conversion to Unix/protocol
-                    send_filename = filename.replace('\\', '/')
-                else:
-                    send_filename = filename
-                file_details = '%s\n%d\n%d\n' % (send_filename, mtime, data_len)  # FIXME non-asci filenames
-                logger.debug('file_details: %r', file_details)
-                f = open(filename, 'rb')
-                data = f.read()
-                f.close()
-                self.request.send(file_details)
-                self.request.send(data)
-                sent_count += 1
+                try:
+                    logger.debug('File to send: %r', filename)
+                    mtime, data_len = server_files[filename]
+                    if os.path.sep == '\\':
+                        # Windows path conversion to Unix/protocol
+                        send_filename = filename.replace('\\', '/')
+                    else:
+                        send_filename = filename
+                    if isinstance(send_filename, str):
+                        # Assume str, in locale encoding
+                        send_filename = send_filename.decode(SYSTEM_ENCODING)
+                    if isinstance(send_filename, unicode):
+                        # Need to send binary/byte across wire
+                        send_filename = send_filename.encode(FILENAME_ENCODING)
+
+                    file_details = '%s\n%d\n%d\n' % (send_filename, mtime, data_len)
+                    logger.debug('file_details: %r', file_details)
+                    f = open(filename, 'rb')
+                    data = f.read()
+                    f.close()
+                    self.request.send(file_details)
+                    self.request.send(data)
+                    sent_count += 1
+                except UnicodeEncodeError:
+                    # Skip this file
+                    logger.error('Encoding error - unable to access and process %r, ignoring"', filename)
+                    skip_count += 1
+                    continue
 
             # Tell client there are no files to send back
             self.request.sendall('\n')
         finally:
             os.chdir(current_dir)
         sync_timer.stop()
-        logger.info('Successfully checked %r, set sent %r files in %s', len(server_files), sent_count, sync_timer)
+        if skip_count:
+            skip_count_str = ', skipped %d' % skip_count
+        else:
+            skip_count_str = ''
+        logger.info('Successfully checked %r, set sent %r%s files in %s', len(server_files), sent_count, skip_count_str, sync_timer)
         logger.info('Client %r disconnected' % (self.request.getpeername(),))
 
 
@@ -609,7 +678,7 @@ def run_server(config):
     server.serve_forever()
 
 
-def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTOCOL_TYPE_FROM_SERVER_USE_TIME, recursive=False, username=None, password=None):
+def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTOCOL_TYPE_FROM_SERVER_USE_TIME, recursive=False, use_ssl=None, ssl_server_certfile=None, ssl_client_certfile=None, ssl_client_keyfile=None, username=None, password=None):
     """Implements SK Client, currently only supports:
        * direction =  "from server (use time)" ONLY
     """
@@ -625,14 +694,60 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
     file_list = get_file_listings(real_client_path, recursive=recursive)
     file_list_info = []
     for filename, mtime in file_list:
-        file_details = '%d %s' % (mtime, filename)
-        file_list_info.append(file_details)
-    logger.info('Number of files on client %d', len(file_list_info))
+        try:
+            if isinstance(filename, str):
+                # Assume str, in locale encoding
+                filename = filename.decode(SYSTEM_ENCODING)
+            if isinstance(filename, unicode):
+                # Need to send binary/byte across wire
+                filename = filename.encode(FILENAME_ENCODING)
+            file_details = '%d %s' % (mtime, filename)
+            file_list_info.append(file_details)
+        except UnicodeEncodeError:
+            # Skip this file
+            logger.error('Encoding error - unable to access and process %r, ignoring"', filename)
+            # TODO log summary of skipped files at end
+            continue
+    logger.info('Number of files on client %d', len(file_list))
+    logger.info('Number of files to process on client %d', len(file_list_info))
+    delta = len(file_list) - len(file_list_info)
+    if delta != 0:
+        logger.info('Skiping %d', delta)
     file_list_str = '\n'.join(file_list_info)
 
     # Connect to the server
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((ip, port))
+
+    if use_ssl:
+        try:
+            logger.info('Attempting SSL session')
+            if ssl_server_certfile:
+                logger.info('using SSL certificate file  %r' % ssl_server_certfile)
+                if ssl_client_certfile:
+                    s = ssl.wrap_socket(s,
+                               ca_certs=ssl_server_certfile,
+                               cert_reqs=ssl.CERT_REQUIRED,
+                               certfile=ssl_client_certfile,
+                               keyfile=ssl_client_keyfile,
+                               ssl_version=SSL_VERSION)
+                else:
+                    # assume that if server is checking client cert, client will be checking server cert
+                    s = ssl.wrap_socket(s,
+                               ca_certs=ssl_server_certfile,
+                               cert_reqs=ssl.CERT_REQUIRED,
+                               ssl_version=SSL_VERSION)
+            else:
+                logger.info('ignoring SSL certificate')
+                s = ssl.wrap_socket(s,
+                               cert_reqs=ssl.CERT_NONE,
+                               ssl_version=SSL_VERSION)
+            s.connect((ip, port))
+            logger.info('SSL connected using %r', s.cipher())
+        except ssl.SSLError, info:
+            logger.error('Error starting SSL connection, check SSL is enabled on server and certificate and key are valid. %r' % info)
+            return
+    else:
+        s.connect((ip, port))
     logger.info('connected')
     reader = SKBufferedSocket(s)
 
@@ -746,6 +861,13 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
     
     # type of sync? and folders to sync (server path, client path)
     # example: '0\n/tmp/skmemos\n/sdcard/skmemos\n\n'
+    if isinstance(server_path, unicode):
+        # Need to send binary/byte across wire
+        server_path = server_path.encode(FILENAME_ENCODING)
+    if isinstance(client_path, unicode):
+        # Need to send binary/byte across wire
+        client_path = client_path.encode(FILENAME_ENCODING)
+
     if file_list_str:
         # FIXME this could be refactored....
         message = recursive_type + server_path + '\n' + client_path + '\n' + file_list_str + '\n\n'
@@ -766,6 +888,7 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
     while response != '\n':
         filename = response[:-1]  # loose trailing \n
         logger.debug('filename: %r' % filename)
+        filename = filename.decode(FILENAME_ENCODING)
         mtime = reader.next()
         logger.debug('mtime: %r' % mtime)
         mtime = norm_mtime(mtime)
@@ -808,8 +931,16 @@ def run_client(config, config_name='client'):
 
     client_config = config[config_name]
     server_path, client_path = client_config['server_path'], client_config['client_path']
+    recursive = client_config.get('recursive')
+
     username, password = config.get('username'), config.get('password')
-    client_start_sync(host, port, server_path, client_path, username=username, password=password)
+
+    use_ssl = config.get('use_ssl')
+    ssl_server_certfile = config.get('ssl_server_certfile')
+
+    ssl_client_certfile = config.get('ssl_client_certfile')
+    ssl_client_keyfile = config.get('ssl_client_keyfile')
+    client_start_sync(host, port, server_path, client_path, recursive=recursive, use_ssl=use_ssl, ssl_server_certfile=ssl_server_certfile, ssl_client_certfile=ssl_client_certfile, ssl_client_keyfile=ssl_client_keyfile, username=username, password=password)
 
 
 def main(argv=None):
