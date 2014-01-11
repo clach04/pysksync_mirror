@@ -680,6 +680,7 @@ def run_server(config):
          (this is not a normal SK Sync option)
     """
 
+    config = set_default_config(config)
     if config.get('sksync1_compat') and (config.get('use_ssl') or config.get('require_auth', True)):
         logger.error('Compatibility with SK Sync 1 and use_ssl/require_auth are incompatible options.')
         raise NotAllowed('SK sync v1 support and use_ssl/require_auth at the same time.')
@@ -963,6 +964,7 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
 
 
 def run_client(config, config_name='client'):
+    config = set_default_config(config)
     host, port = config['host'], config['port']
     if host == '0.0.0.0':
         host = 'localhost'
@@ -980,6 +982,15 @@ def run_client(config, config_name='client'):
     ssl_client_certfile = config.get('ssl_client_certfile')
     ssl_client_keyfile = config.get('ssl_client_keyfile')
     client_start_sync(host, port, server_path, client_path, recursive=recursive, use_ssl=use_ssl, ssl_server_certfile=ssl_server_certfile, ssl_client_certfile=ssl_client_certfile, ssl_client_keyfile=ssl_client_keyfile, sksync1_compat=sksync1_compat, username=username, password=password)
+
+
+def set_default_config(config):
+    # defaults
+    config['host'] = config.get('host', '0.0.0.0')
+    config['port'] = config.get('port', SKSYNC_DEFAULT_PORT)
+    config['sksync1_compat'] = config.get('sksync1_compat', False)
+    config['use_ssl'] = config.get('use_ssl', False)
+    return config
 
 
 def main(argv=None):
@@ -1002,9 +1013,7 @@ def main(argv=None):
         config = {}
 
     # defaults
-    config['host'] = config.get('host', '0.0.0.0')
-    config['port'] = config.get('port', SKSYNC_DEFAULT_PORT)
-    config['require_auth'] = config.get('require_auth', True)
+    config = set_default_config(config)
     #print dump_json(config, indent=4)
 
     if 'client' in argv:
