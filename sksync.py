@@ -16,6 +16,7 @@ import select
 import logging
 import glob
 import errno
+import binascii
 import locale
 import zlib
 
@@ -68,12 +69,40 @@ else:
     dump_json = json.dumps
     load_json = json.loads
 
+try:
+    import easydialogs
+except ImportError:
+    try:
+        import EasyDialogs as easydialogs
+    except ImportError:
+        easydialogs = None
+
+
+def fake_module(name):
+    # Fail with a clear message (possibly at an unexpected time in the future)
+    class MissingModule(object):
+        def __getattr__(self, attr):
+            raise ImportError('No module named %s' % name)
+
+        def __nonzero__(self):
+            return False
+
+    return MissingModule()
+
+try:
+    import srp  # from https://pypi.python.org/pypi/srp
+except ImportError:
+    srp = fake_module('srp')
+
 
 PYSKSYNC_FILENAME_ENCODING = 'UTF-8'
 FILENAME_ENCODING = 'cp1252'  # latin1 encoding used by sksync 1
 language_name, SYSTEM_ENCODING = locale.getdefaultlocale()
-#print language_name, SYSTEM_ENCODING
+# SYSTEM_ENCODING is usually set. If not, default to UTF-8
+# (a good default for Unix, Android, Mac.)
+SYSTEM_ENCODING = SYSTEM_ENCODING or 'UTF-8'  # TODO could allow config setting override
 
+# SK Sync specific constants
 SKSYNC_DEFAULT_PORT = 23456
 #SKSYNC_DEFAULT_PORT = 23456 + 1  # FIXME DEBUG not default!!
 #SKSYNC_DEFAULT_PORT = 23456 + 3  # FIXME DEBUG not default!!
@@ -94,19 +123,44 @@ if ssl:
     SSL_VERSION = ssl.PROTOCOL_TLSv1
 
 
+# PYSKSYNC specific constants
+PYSKSYNC_CR_START = 'PYSKSYNC SRP START:'  # Challenge Response start message
+
+
 class BaseSkSyncException(Exception):
     '''Base SK Sync exception'''
 
 class NotAllowed(BaseSkSyncException):
     '''Requested operation not allowed exception'''
 
+class PAKEFailure(BaseSkSyncException):
+    '''Password authenticated key agreement exception
+    Either client has wrong password, or server does.'''
+
 
 logging.basicConfig()
-logger = logging
 logger = logging.getLogger("sksync")
+"""
+logging_fmt_str = "%(process)d %(thread)d %(asctime)s - %(name)s %(filename)s:%(lineno)d - %(levelname)s - %(message)s"
+ch = logging.StreamHandler()  # use stdio
+formatter = logging.Formatter(logging_fmt_str)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+"""
 #logger.setLevel(logging.INFO)
 #logger.setLevel(logging.DEBUG)
 
+IGNORE_SET_TIME_ERRORS = False
+
+def set_utime(a, b):
+    try:
+        os.utime(a, b)
+    except OSError, info:
+        if IGNORE_SET_TIME_ERRORS:
+            # probably Android https://groups.google.com/forum/#!msg/python-for-android/MlOLiTOeK0o/_5m2jtvXsNIJ
+            pass
+        else:
+            raise
 
 def safe_mkdir(newdir):
     result_dir = os.path.abspath(newdir)
@@ -299,6 +353,9 @@ def get_file_listings(path_of_files, recursive=False, include_size=False, return
                 listings_result.append(file_details)
             else:
                 listings_result[filename] = file_details[1:]
+        elif os.path.isdir(filename):
+            # no need to process directories
+            pass
         else:
             # Probably Windows, with a (byte/str) filename containing
             # characters that are NOT in the current locale we can't
@@ -318,9 +375,12 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
     """
 
     def handle(self):
-        logger.info('Client %r connected' % (self.request.getpeername(),))
+        logger.info('Client %r connected', (self.request.getpeername(),))
         config = getattr(self.server, 'sksync_config', {})
         config['server_dir_whitelist'] = config.get('server_dir_whitelist', [])
+        raise_errors = config.get('raise_errors', True)
+        config['users'] = config.get('users', {})
+        config['require_auth'] = config.get('require_auth', True)
 
         sync_timer = SimpleTimer()
         sync_timer.start()
@@ -331,8 +391,8 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
                 logger.info('Attempting SSL session')
                 ssl_server_certfile = config.get('ssl_server_certfile')
                 ssl_server_keyfile = config.get('ssl_server_keyfile')
-                logger.info('using SSL certificate file  %r' % ssl_server_certfile)
-                logger.info('using SSL key file  %r' % ssl_server_keyfile)
+                logger.info('using SSL certificate file  %r', ssl_server_certfile)
+                logger.info('using SSL key file  %r', ssl_server_keyfile)
 
                 if config.get('ssl_client_certfile'):
                     self.request = ssl.wrap_socket(self.request,
@@ -350,13 +410,78 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
                                     ssl_version=SSL_VERSION)
                 logger.info('SSL connected using %r', self.request.cipher())
             except ssl.SSLError, info:
-                logger.error('Error starting SSL, check certificate and key are valid. %r' % info)
+                if raise_errors:
+                    raise
+                logger.error('Error starting SSL, check certificate and key are valid. %r', info)
                 # could be a bad client....
                 return
         reader = SKBufferedSocket(self.request)
         response = reader.next()
         logger.debug('Received: %r' % response)
-        assert response in (SKSYNC_PROTOCOL_01, PYSKSYNC_PROTOCOL_01)
+
+        # Start of PYSKSYNC challenge/response
+        if config['require_auth'] or response.startswith(PYSKSYNC_CR_START):
+            if not response.startswith(PYSKSYNC_CR_START):
+                # client is not starting PAKE session
+                raise PAKEFailure()
+
+            # SRP 6a
+            # As per spec, errors result in an abort, PAKEFailure is raised.
+            # Nothing helpful is sent to the peer.
+            logger.info('authenticated connection requested')
+            try:
+                I_hex, A_hex = response[len(PYSKSYNC_CR_START):].split()
+            except ValueError:
+                # bad user/verifier
+                raise PAKEFailure()
+            I, A = binascii.unhexlify(I_hex), binascii.unhexlify(A_hex)
+            logger.info('attempting authentication for user %s' % I)
+
+            #salt, vkey = config['users'][I]['authsrp']
+            authsrp = config['users'].get(I, {}).get('authsrp')
+            if not authsrp:
+                # User does not exist
+                raise PAKEFailure()
+            try:
+                salt, vkey = authsrp
+            except ValueError:
+                # bad user/verifier entry
+                raise PAKEFailure()
+            salt, vkey = binascii.unhexlify(salt), binascii.unhexlify(vkey)
+            svr = srp.Verifier(I, salt, vkey, A)
+            s, B = svr.get_challenge()
+            if s is None or B is None:
+                raise PAKEFailure()
+            message = '%s %s\n' % (binascii.hexlify(s), binascii.hexlify(B))
+            logger.debug('sending: len %d %r' % (len(message), message, ))
+            len_sent = self.request.send(message)
+            logger.debug('sent: len %d' % (len_sent, ))
+
+            response = reader.next()
+            logger.debug('Received: %r' % response)
+            M = binascii.unhexlify(response.strip())
+            HAMK = svr.verify_session(M)
+            if HAMK is None:
+                # PAKEFailure, send client empty string so client knows there was a PAKEFailure
+                HAMK = ''
+            message = '%s\n' % (binascii.hexlify(HAMK),)
+            logger.debug('sending: len %d %r' % (len(message), message, ))
+            len_sent = self.request.send(message)
+            logger.debug('sent: len %d' % (len_sent, ))
+            if not svr.authenticated():
+                logger.error('SRP PAKEFailure server side, client auth does not match server.')
+                if raise_errors:
+                    raise PAKEFailure()
+                else:
+                    return
+            # svr.K is now a shared key available to use
+
+            # Resume SKSYNC PROTOCOL
+            response = reader.next()
+            logger.debug('Received: %r' % response)
+
+        # Start of SKSYNC PROTOCOL 01
+        assert response in (SKSYNC_PROTOCOL_01, PYSKSYNC_PROTOCOL_01), 'unexpected protocol, %r' % (response,)
         # PYSKSYNC_PROTOCOL_01 is the same as SKSYNC_PROTOCOL_01 but using UTF-8 for filenames
         if response == SKSYNC_PROTOCOL_01:
             filename_encoding = FILENAME_ENCODING
@@ -366,15 +491,15 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
 
         message = SKSYNC_PROTOCOL_ESTABLISHED
         len_sent = self.request.send(message)
-        logger.debug('sent: len %d %r' % (len_sent, message, ))
+        logger.debug('sent: len %d %r', len_sent, message)
 
         response = reader.next()
-        logger.debug('Received: %r' % response)
+        logger.debug('Received: %r', response)
         assert response in (SKSYNC_PROTOCOL_TYPE_FROM_SERVER_USE_TIME, ), repr(response)  # type of sync
         # FROM SERVER appears to use the same protocol, the difference is in the server logic for working out which files to send to the client
 
         response = reader.next()
-        logger.debug('Received: %r' % response)
+        logger.debug('Received: %r', response)
         assert response in (SKSYNC_PROTOCOL_NON_RECURSIVE, SKSYNC_PROTOCOL_RECURSIVE)  # start of path (+file) info
         
         if response == SKSYNC_PROTOCOL_NON_RECURSIVE:
@@ -384,10 +509,10 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
             recursive = True
         
         server_path = reader.next()
-        logger.debug('server_path: %r' % server_path)
+        logger.debug('server_path: %r', server_path)
         server_path = server_path[:-1]  # loose trailing \n
         server_path = os.path.abspath(server_path)
-        logger.debug('server_path abs: %r' % server_path)
+        logger.debug('server_path abs: %r', server_path)
         server_dir_whitelist = []
         if config['server_dir_whitelist']:
             server_dir_whitelist = []
@@ -405,35 +530,35 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
                     raise NotAllowed('access to path %r' % server_path)
 
         client_path = reader.next()
-        logger.debug('client_path: %r' % client_path)
+        logger.debug('client_path: %r', client_path)
 
         # possible first file details
         response = reader.next()
-        logger.debug('Received: %r' % response)
+        logger.debug('Received: %r', response)
         client_files = {}
         while response != '\n':
             # TODO start counting and other stats
             # read all file details
             filename, mtime = parse_file_details(response)
-            logger.debug('Received meta data for: %r' % ((filename, mtime),))
+            logger.debug('Received meta data for: %r', ((filename, mtime),))
             filename = filename.decode(filename_encoding)
             if os.path.sep == '\\':
                 # Windows
                 filename = filename.replace('/', '\\')  # Unix path conversion to Windows
             client_files[filename] = mtime
             response = reader.next()
-            logger.debug('Received: %r' % response)
+            logger.debug('Received: %r', response)
         
         # we're done receiving data from client now
         self.request.send('\n')
         
         # TODO start counting and other stats
         # TODO output count and other stats
-        logger.info('Number of files on client %r ' % (len(client_files),))
+        logger.info('Number of files on client %r ', (len(client_files),))
         # NOTE if sync type is SKSYNC_PROTOCOL_TYPE_FROM_SERVER_* and
         # server_path does not exist, SK Sync simply returns 0 files
         server_files = get_file_listings(server_path, recursive=recursive, include_size=True, return_list=False, force_unicode=True)
-        logger.info('Number of files on server %r ' % (len(server_files),))
+        logger.info('Number of files on server %r ', (len(server_files),))
         
         server_files_set = set(server_files)
         client_files_set = set(client_files)
@@ -466,7 +591,7 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
         
         # send new files to the client
         # TODO deal with incoming files from client
-        logger.info('Number of files for server to send %r out of %r ' % (len(missing_from_client), len(server_files)))
+        logger.info('Number of files for server to send %r out of %r ', len(missing_from_client), len(server_files))
         # TODO consider a progress bar/percent base on number of missing files (not byte count)
         current_dir = os.getcwd()  # TODO non-ascii; os.getcwdu()
         os.chdir(server_path)
@@ -529,7 +654,7 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
         else:
             skip_count_str = ''
         logger.info('Successfully checked %r, sent %r bytes in %r%s files in %s', len(server_files), byte_count_sent, sent_count, skip_count_str, sync_timer)
-        logger.info('Client %r disconnected' % (self.request.getpeername(),))
+        logger.info('Client %r disconnected', self.request.getpeername())
 
 
 class StoppableTCPServer(SocketServer.ThreadingTCPServer):
@@ -610,9 +735,9 @@ def run_server(config):
     """
 
     config = set_default_config(config)
-    if config.get('sksync1_compat') and config.get('use_ssl'):
-        logger.error('Compatibility with SK Sync 1 and SSL support are incompatible options.')
-        raise NotAllowed('SK sync v1 support and SSL support at the same time.')
+    if config.get('sksync1_compat') and (config.get('use_ssl') or config.get('require_auth', True)):
+        logger.error('Support for SK Sync v1 is incompatible with use_ssl/require_auth options.')
+        raise NotAllowed('Support for SK Sync v1 is incompatible with use_ssl/require_auth options.')
 
     host, port = config['host'], config['port']
 
@@ -627,7 +752,7 @@ def run_server(config):
     server.serve_forever()
 
 
-def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTOCOL_TYPE_FROM_SERVER_USE_TIME, recursive=False, use_ssl=None, ssl_server_certfile=None, ssl_client_certfile=None, ssl_client_keyfile=None, sksync1_compat=False):
+def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTOCOL_TYPE_FROM_SERVER_USE_TIME, recursive=False, use_ssl=None, ssl_server_certfile=None, ssl_client_certfile=None, ssl_client_keyfile=None, sksync1_compat=False, raise_errors=True, username=None, password=None):
     """Implements SK Client, currently only supports:
        * direction =  "from server (use time)" ONLY
     """
@@ -636,9 +761,12 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
     real_client_path = os.path.abspath(client_path)
     file_list_str = ''
 
-    if sksync1_compat and use_ssl:
-        logger.error('Compatibility with SK Sync 1 and SSL support are incompatible options.')
-        raise NotAllowed('SK sync v1 support and SSL support at the same time.')
+    username = username or ''
+    password = password or ''
+
+    if sksync1_compat and (use_ssl or (username or password)):
+        logger.error('Support for SK Sync v1 is incompatible with SSL/SRP options.')
+        raise NotAllowed('Support for SK Sync v1 is incompatible with SSL/SRP options.')
 
     sync_timer = SimpleTimer()
     sync_timer.start()
@@ -650,8 +778,15 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
         filename_encoding = PYSKSYNC_FILENAME_ENCODING
         sync_protocol = PYSKSYNC_PROTOCOL_01
 
+    logger.info('server_path %r', server_path)
+    logger.info('client_path %r', client_path)
+    # Make filenames/paths Unicode
+    client_path = client_path.encode(SYSTEM_ENCODING)
+    real_client_path = os.path.abspath(client_path)
+    file_list_str = ''
+
     logger.info('filename_encoding %r', filename_encoding)
-    logger.info('determining client files')
+    logger.info('determining client files for %r', real_client_path)
     file_list = get_file_listings(real_client_path, recursive=recursive)
     file_list_info = []
     for filename, mtime in file_list:
@@ -684,7 +819,7 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
         try:
             logger.info('Attempting SSL session')
             if ssl_server_certfile:
-                logger.info('using SSL certificate file  %r' % ssl_server_certfile)
+                logger.info('using SSL certificate file  %r', ssl_server_certfile)
                 if ssl_client_certfile:
                     s = ssl.wrap_socket(s,
                                ca_certs=ssl_server_certfile,
@@ -706,26 +841,117 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
             s.connect((ip, port))
             logger.info('SSL connected using %r', s.cipher())
         except ssl.SSLError, info:
-            logger.error('Error starting SSL connection, check SSL is enabled on server and certificate and key are valid. %r' % info)
+            if raise_errors:
+                raise
+            logger.error('Error starting SSL connection, check SSL is enabled on server and certificate and key are valid. %r', info)
             return
     else:
         s.connect((ip, port))
     logger.info('connected')
+    reader = SKBufferedSocket(s)
+
+    if username or password:
+        # SRP-6a - Secure Remote Password protocol
+        """http://srp.stanford.edu/design.html
+
+          N    A large safe prime (N = 2q+1, where q is prime)
+               All arithmetic is done modulo N.
+          g    A generator modulo N
+          k    Multiplier parameter (k = H(N, g) in SRP-6a, k = 3 for legacy SRP-6)
+          s    User's salt
+          I    Username
+          p    Cleartext Password
+          H()  One-way hash function
+          ^    (Modular) Exponentiation
+          u    Random scrambling parameter
+          a,b  Secret ephemeral values
+          A,B  Public ephemeral values
+          x    Private key (derived from p and s)
+          v    Password verifier
+
+        The host stores passwords using the following formula:
+
+          x = H(s, p)               (s is chosen randomly)
+          v = g^x                   (computes password verifier)
+
+        The host then keeps {I, s, v} in its password database.
+        The authentication protocol itself goes as follows:
+
+        User -> Host:  I, A = g^a                  (identifies self, a = random number)
+        Host -> User:  s, B = kv + g^b             (sends salt, b = random number)
+
+                Both:  u = H(A, B)
+
+                User:  x = H(s, p)                 (user enters password)
+                User:  S = (B - kg^x) ^ (a + ux)   (computes session key)
+                User:  K = H(S)
+
+                Host:  S = (Av^u) ^ b              (computes session key)
+                Host:  K = H(S)
+
+        Now the two parties have a shared, strong session key K. To complete
+        authentication, they need to prove to each other that their keys
+        match. One possible way:
+
+        User -> Host:  M = H(H(N) xor H(g), H(I), s, A, B, K)
+        Host -> User:  H(A, M, K)
+
+        The two parties also employ the following safeguards:
+
+            The user will abort if he receives B == 0 (mod N) or u == 0.
+            The host will abort if it detects that A == 0 (mod N).
+            The user must show his proof of K first. If the server detects that
+                the user's proof is incorrect, it must abort without showing its
+                own proof of K. 
+        """
+        logger.info('attempting authentication for user %s' % username)
+        usr = srp.User(username, password)
+        I, A = usr.start_authentication()
+
+        message = '%s%s %s\n' % (PYSKSYNC_CR_START, binascii.hexlify(I), binascii.hexlify(A))
+        logger.debug('sending: len %d %r' % (len(message), message, ))
+        len_sent = s.send(message)
+        logger.debug('sent: len %d' % (len_sent, ))
+
+        response = reader.next()
+        logger.debug('Received: %r' % response)
+        s_hex, B_hex = response.split()
+        _s, B = binascii.unhexlify(s_hex), binascii.unhexlify(B_hex)
+
+        if s is None or B is None:
+            raise PAKEFailure()
+
+        M = usr.process_challenge(_s, B)
+        if M is None:
+            raise PAKEFailure()
+        message = '%s\n' % (binascii.hexlify(M),)
+        logger.debug('sending: len %d %r' % (len(message), message, ))
+        len_sent = s.send(message)
+        logger.debug('sent: len %d' % (len_sent, ))
+
+        response = reader.next()
+        logger.debug('Received: %r' % response)
+        HAMK = binascii.unhexlify(response.strip())
+        # if HAMK == '', we have a failure, this will be detected in verify_session()
+
+        usr.verify_session(HAMK)
+        if not usr.authenticated():
+            raise PAKEFailure()
+        # usr.K is now a shared key available to use
 
     message = sync_protocol
     len_sent = s.send(message)
-    logger.debug('sent: len %d %r' % (len_sent, message, ))
+    logger.debug('sent: len %d %r', len_sent, message)
     
-    reader = SKBufferedSocket(s)
     # Receive a response
     response = reader.next()
-    logger.debug('Received: %r' % response)
+    logger.debug('Received: %r', response)
     assert response == SKSYNC_PROTOCOL_ESTABLISHED
 
     # type of sync
     message = sync_type
     len_sent = s.send(message)
-    logger.debug('sent: len %d %r' % (len_sent, message, ))
+    logger.debug('sent: len %d %r', len_sent, message)
     
     recursive_type = SKSYNC_PROTOCOL_NON_RECURSIVE
     if recursive:
@@ -746,59 +972,63 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
     else:
         message = recursive_type + server_path + '\n' + client_path + '\n\n'
     len_sent = s.send(message)
-    logger.debug('sent: len %d %r' % (len_sent, message, ))
+    logger.debug('sent: len %d %r', len_sent, message)
 
     # Receive a response
     response = reader.next()
-    logger.debug('Received: %r' % response)
+    logger.debug('Received: %r', response)
     assert response == '\n'
 
     # if get CR end of session, otherwise get files
     response = reader.next()
-    logger.debug('Received: %r' % response)
+    logger.debug('Received: %r', response)
     received_file_count = 0
     byte_count_recv = 0
     while response != '\n':
         filename = response[:-1]  # loose trailing \n
-        logger.debug('filename: %r' % filename)
+        logger.debug('filename: %r', filename)
         filename = filename.decode(filename_encoding)
         mtime = reader.next()
-        logger.debug('mtime: %r' % mtime)
+        logger.debug('mtime: %r', mtime)
         mtime = norm_mtime(mtime)
         mtime = unnorm_mtime(mtime)
-        logger.debug('mtime: %r' % mtime)
+        logger.debug('mtime: %r', mtime)
         filesize = reader.next()
-        logger.debug('filesize: %r' % filesize)
+        logger.debug('filesize: %r', filesize)
         filesize_split = filesize.split()
         if len(filesize_split) == 2:
             compression_type, filesize = filesize_split
         else:
             compression_type = None
         filesize = int(filesize)
-        logger.debug('filesize: %r' % filesize)
-        logger.info('processing %r' % ((filename, filesize, mtime),))  # TODO add option to supress this?
+        logger.debug('filesize: %r', filesize)
+        logger.info('processing %r', ((filename, filesize, mtime),))  # TODO add option to supress this?
         
         # now read filesize bytes....
         filecontents = reader.recv(filesize)
-        logger.debug('filecontents: %r' % filecontents)
+        logger.debug('filecontents: %r', filecontents)
         if compression_type:
             # TODO handle different compression types...
             filecontents = zlib.decompress(filecontents)
 
         full_filename = os.path.join(real_client_path, filename)
         full_filename_dir = os.path.dirname(full_filename)
+        # Not all platforms support Unicode file names (e.g. Python android)
+        full_filename = full_filename.encode(SYSTEM_ENCODING)
+        full_filename_dir = full_filename_dir.encode(SYSTEM_ENCODING)
+
         #if not exists full_filename_dir
         safe_mkdir(full_filename_dir)
         f = open(full_filename, 'wb')
         f.write(filecontents)
         f.close()
-        os.utime(full_filename, (mtime, mtime))
+        set_utime(full_filename, (mtime, mtime))
         received_file_count += 1
         byte_count_recv += len(filecontents)
 
         # any more files?
         response = reader.next()
-        logger.debug('Received: %r' % response)
+        logger.debug('Received: %r', response)
 
     # Clean up
     s.close()
@@ -817,10 +1047,12 @@ def run_client(config, config_name='client'):
         host = 'localhost'
 
     sksync1_compat = config.get('sksync1_compat')
-    client_config = config[config_name]
+    client_config = config['clients'][config_name]
     server_path, client_path = client_config['server_path'], client_config['client_path']
     host, port = client_config.get('host', host), client_config.get('port', port)
     recursive = client_config.get('recursive')
+
+    username, password = config.get('username'), config.get('password')
 
     use_ssl = config.get('use_ssl')
     ssl_server_certfile = config.get('ssl_server_certfile')
@@ -830,7 +1062,7 @@ def run_client(config, config_name='client'):
     ssl_client_keyfile = config.get('ssl_client_keyfile')
     ssl_client_keyfile = client_config.get('ssl_client_keyfile', ssl_client_keyfile)
     ssl_client_certfile = client_config.get('ssl_client_certfile', ssl_client_keyfile)
-    client_start_sync(host, port, server_path, client_path, recursive=recursive, use_ssl=use_ssl, ssl_server_certfile=ssl_server_certfile, ssl_client_certfile=ssl_client_certfile, ssl_client_keyfile=ssl_client_keyfile, sksync1_compat=sksync1_compat)
+    client_start_sync(host, port, server_path, client_path, recursive=recursive, use_ssl=use_ssl, ssl_server_certfile=ssl_server_certfile, ssl_client_certfile=ssl_client_certfile, ssl_client_keyfile=ssl_client_keyfile, sksync1_compat=sksync1_compat, username=username, password=password)
 
 
 def set_default_config(config):
@@ -838,8 +1070,57 @@ def set_default_config(config):
     config['host'] = config.get('host', '0.0.0.0')
     config['port'] = config.get('port', SKSYNC_DEFAULT_PORT)
     config['sksync1_compat'] = config.get('sksync1_compat', False)
+    config['ignore_time_errors'] = config.get('ignore_time_errors', False)
+    global IGNORE_SET_TIME_ERRORS
+    IGNORE_SET_TIME_ERRORS = config['ignore_time_errors']
     config['use_ssl'] = config.get('use_ssl', False)
+    if config['sksync1_compat']:
+        config['require_auth'] = config.get('require_auth', False)
+    else:
+        config['require_auth'] = config.get('require_auth', True)
     return config
+
+
+def easydialogs_gui(config):
+    """Easydialogs does not support menus or list of items.
+    It does support YesNoCancel so this can be subverted to allow two options
+    and quit, (ab)use this to allow server or client to be started.
+    For client, allow picking out of only two client settings to be selected.
+    """
+    easydialogs_yes = 1
+    easydialogs_no = 0
+    easydialogs_cancel = -1
+
+    # NOTE GTK easydialogs.AskYesNoCancel() default param does NOT work
+    #result = easydialogs.AskYesNoCancel('sksync', default=-1, yes='Server', no='Client', cancel='Quit')
+    result = easydialogs.AskYesNoCancel('sksync', yes='Server', no='Client', cancel='Quit')
+
+    if result == easydialogs_yes:
+        run_server(config)
+    elif result == easydialogs_no:
+        # Show Client menu
+        client_names = list(config.get('clients', {}).keys())
+        print client_names
+        if 'client_1' not in client_names:
+            client_names.append('client_1')
+        if 'client_2' not in client_names:
+            client_names.append('client_2')
+        print client_names
+        # just pick first, don't pop()
+        client_1 = client_names[0]
+        client_2 = client_names[1]
+        # Hack for gtk easydialogs, which does NOT accept Unicode type strings but does accept utf-8 Unicode encoding byte strings
+        client_1 = client_1.encode('utf-8')
+        client_2 = client_2.encode('utf-8')
+
+        client_result = easydialogs_yes
+        while client_result != easydialogs_cancel:
+            client_result = easydialogs.AskYesNoCancel('Client', yes=client_1, no=client_2, cancel='Quit')
+            if client_result == easydialogs_yes:
+                config_name = client_1
+            elif client_result == easydialogs_no:
+                config_name = client_2
+            run_client(config, config_name=config_name)
 
 
 def main(argv=None):
@@ -863,8 +1144,11 @@ def main(argv=None):
 
     # defaults
     config = set_default_config(config)
+    #print dump_json(config, indent=4)
 
-    if 'client' in argv:
+    if 'gui' in argv:
+        easydialogs_gui(config)
+    elif 'client' in argv:
         config_name = argv[-1]
         run_client(config, config_name=config_name)
     else:
