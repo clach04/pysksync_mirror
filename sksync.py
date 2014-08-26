@@ -97,7 +97,9 @@ except ImportError:
 PYSKSYNC_FILENAME_ENCODING = 'UTF-8'
 FILENAME_ENCODING = 'cp1252'  # latin1 encoding used by sksync 1
 language_name, SYSTEM_ENCODING = locale.getdefaultlocale()
-#print language_name, SYSTEM_ENCODING
+# SYSTEM_ENCODING is usually set. If not, default to UTF-8
+# (a good default for Unix, Android, Mac.)
+SYSTEM_ENCODING = SYSTEM_ENCODING or 'UTF-8'  # TODO could allow config setting override
 
 # SK Sync specific constants
 SKSYNC_DEFAULT_PORT = 23456
@@ -147,6 +149,17 @@ logger.addHandler(ch)
 #logger.setLevel(logging.INFO)
 #logger.setLevel(logging.DEBUG)
 
+IGNORE_SET_TIME_ERRORS = False
+
+def set_utime(a, b):
+    try:
+        os.utime(a, b)
+    except OSError, info:
+        if IGNORE_SET_TIME_ERRORS:
+            # probably Android https://groups.google.com/forum/#!msg/python-for-android/MlOLiTOeK0o/_5m2jtvXsNIJ
+            pass
+        else:
+            raise
 
 def safe_mkdir(newdir):
     result_dir = os.path.abspath(newdir)
@@ -751,8 +764,15 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
         filename_encoding = PYSKSYNC_FILENAME_ENCODING
         sync_protocol = PYSKSYNC_PROTOCOL_01
 
+    logger.info('server_path %r', server_path)
+    logger.info('client_path %r', client_path)
+    # Make filenames/paths Unicode
+    client_path = client_path.encode(SYSTEM_ENCODING)
+    real_client_path = os.path.abspath(client_path)
+    file_list_str = ''
+
     logger.info('filename_encoding %r', filename_encoding)
-    logger.info('determining client files')
+    logger.info('determining client files for %r', real_client_path)
     file_list = get_file_listings(real_client_path, recursive=recursive)
     file_list_info = []
     for filename, mtime in file_list:
@@ -971,12 +991,16 @@ def client_start_sync(ip, port, server_path, client_path, sync_type=SKSYNC_PROTO
         
         full_filename = os.path.join(real_client_path, filename)
         full_filename_dir = os.path.dirname(full_filename)
+        # Not all platforms support Unicode file names (e.g. Python android)
+        full_filename = full_filename.encode(SYSTEM_ENCODING)
+        full_filename_dir = full_filename_dir.encode(SYSTEM_ENCODING)
+
         #if not exists full_filename_dir
         safe_mkdir(full_filename_dir)
         f = open(full_filename, 'wb')
         f.write(filecontents)
         f.close()
-        os.utime(full_filename, (mtime, mtime))
+        set_utime(full_filename, (mtime, mtime))
         received_file_count += 1
         byte_count_recv += len(filecontents)
 
@@ -1024,6 +1048,9 @@ def set_default_config(config):
     config['host'] = config.get('host', '0.0.0.0')
     config['port'] = config.get('port', SKSYNC_DEFAULT_PORT)
     config['sksync1_compat'] = config.get('sksync1_compat', False)
+    config['ignore_time_errors'] = config.get('ignore_time_errors', False)
+    global IGNORE_SET_TIME_ERRORS
+    IGNORE_SET_TIME_ERRORS = config['ignore_time_errors']
     config['use_ssl'] = config.get('use_ssl', False)
     if config['sksync1_compat']:
         config['require_auth'] = config.get('require_auth', False)
